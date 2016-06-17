@@ -9,6 +9,8 @@
  */
 
 #include <node.h>
+// http://stackoverflow.com/questions/30141137/use-libuv-function-in-node-js-0-12-x
+#include <uv.h>
 #include <v8.h>
 #include <systemd/sd-journal.h>
 #include <stdlib.h>
@@ -16,26 +18,28 @@
 using namespace std;
 using namespace v8;
 
-Handle<Value> Async(const Arguments& args);
+void Async(const FunctionCallbackInfo<Value>& args);
 void AsyncWork(uv_work_t* req);
 void AsyncAfter(uv_work_t* req);
 
 struct Baton {
-    uv_work_t request;
-    Persistent<Function> callback;
-    bool error;
-    int32_t result;
-    struct iovec *iov;
-    int argc;
+  uv_work_t request;
+  Persistent<Function> callback;
+  bool error;
+  int32_t result;
+  struct iovec *iov;
+  int argc;
+  Isolate* isolate;
 };
 
 /**
- * Log string messages to the journal. Type checking of the arguments is performed
+ * Log string messages to the journal. Type checking of the args is performed
  * in the journald.js module. If the last argument is a function, we log
  * asyncronously and treat the function as a callback.
  */
-Handle<Value> SdJournalSend(const Arguments& args) {
-  HandleScope scope;
+void SdJournalSend(const FunctionCallbackInfo<Value>& args) {
+  // http://stackoverflow.com/questions/27033241/v8-on-android-ndk-build-throws-error-v8handlescopehandlescope-is-prot
+  Isolate* isolate = args.GetIsolate(); // the current VM instance
   int argc = args.Length();
   struct iovec *iov = NULL;
   bool isAsync = false;
@@ -52,13 +56,14 @@ Handle<Value> SdJournalSend(const Arguments& args) {
   // thread.
   iov = (iovec*) malloc(argc * sizeof(struct iovec));
   if (!iov) {
-    return ThrowException(String::New("Out of memory"));
+    isolate->ThrowException(String::NewFromUtf8(isolate, "Out of memory"));
   }
   for (int i = 0; i < argc; ++i) {
     Local<String> v8str = args[i]->ToString();
     iov[i].iov_len = v8str->Length();
-    iov[i].iov_base = (char*) malloc(v8str->Length() + 1);
-    v8str->WriteAscii((char*)iov[i].iov_base, 0, iov[i].iov_len);
+    iov[i].iov_base = (uint8_t*) malloc(v8str->Length() + 1);
+    // https://bugs.chromium.org/p/v8/issues/detail?id=2588
+    v8str->WriteOneByte((uint8_t*)iov[i].iov_base, 0, iov[i].iov_len);
   }
 
   // Divergent paths for sync and async.
@@ -69,9 +74,11 @@ Handle<Value> SdJournalSend(const Arguments& args) {
     Baton* baton = new Baton();
     baton->error = false;
     baton->request.data = baton;
-    baton->callback = Persistent<Function>::New(callback);
+    // NOTE: Another change is that persistent handles are no longer copyable by default
+    baton->callback.Reset(isolate, callback);
     baton->iov = iov;
     baton->argc = argc;
+    baton->isolate = isolate;
 
     int status = uv_queue_work(uv_default_loop(), &baton->request, AsyncWork, (uv_after_work_cb) AsyncAfter);
     assert(status == 0);
@@ -83,8 +90,6 @@ Handle<Value> SdJournalSend(const Arguments& args) {
     }
     free(iov);
   }
-
-  return scope.Close(Undefined());
 }
 
 /**
@@ -105,13 +110,15 @@ void AsyncWork(uv_work_t* req) {
  * Once the async work completes.
  */
 void AsyncAfter(uv_work_t* req) {
-  HandleScope scope;
   Baton* baton = static_cast<Baton*>(req->data);
+  Isolate* isolate = baton->isolate;
+  HandleScope scope(isolate);
+  Local<Function> callback = Local<Function>::New(isolate, baton->callback);
 
   // TODO: We don't yet set this error flag but the example code is
   // still here for future.
   if (baton->error) {
-    Local<Value> err = Exception::Error(String::New("ERROR"));
+    Local<Value> err = Exception::Error(String::NewFromUtf8(isolate, "ERROR"));
 
     // Prepare the parameters for the callback function.
     const unsigned argc = 1;
@@ -122,9 +129,9 @@ void AsyncAfter(uv_work_t* req) {
     // the exception from JavaScript land using the
     // process.on('uncaughtException') event.
     TryCatch try_catch;
-    baton->callback->Call(Context::GetCurrent()->Global(), argc, argv);
+    callback->Call(Null(isolate), argc, argv);
     if (try_catch.HasCaught()) {
-      node::FatalException(try_catch);
+      node::FatalException(isolate, try_catch);
     }
   }
   else {
@@ -132,8 +139,8 @@ void AsyncAfter(uv_work_t* req) {
     // first argument before the result arguments, as the err parameter.
     const unsigned argc = 2;
     Local<Value> argv[argc] = {
-      Local<Value>::New(Null()),
-      Local<Value>::New(Integer::New(baton->result))
+      Null(isolate),
+      Integer::New(isolate, baton->result)
     };
 
     // Wrap the callback function call in a TryCatch so that we can call
@@ -141,19 +148,19 @@ void AsyncAfter(uv_work_t* req) {
     // the exception from JavaScript land using the
     // process.on('uncaughtException') event.
     TryCatch try_catch;
-    baton->callback->Call(Context::GetCurrent()->Global(), argc, argv);
+    callback->Call(Null(isolate), argc, argv);
     if (try_catch.HasCaught()) {
-      node::FatalException(try_catch);
+      node::FatalException(isolate, try_catch);
     }
   }
 
   // The callback is a permanent handle, so we have to dispose of it manually.
-  baton->callback.Dispose();
+  baton->callback.Reset();
   delete baton;
 }
 
-void init(Handle<Object> target) {
-  target->Set(String::NewSymbol("send"), FunctionTemplate::New(SdJournalSend)->GetFunction());
+void init(Local<Object> exports) {
+  NODE_SET_METHOD(exports, "send", SdJournalSend);
 }
 
 NODE_MODULE(journald_cpp, init)
